@@ -1,0 +1,13 @@
+# YouTube Channel Video Downloader - Requirements
+
+# Primary (Recommended)
+yt-dlp>=2023.0.0
+
+# Fallback
+pytube>=15.0.0
+
+# Image processing
+Pillow>=10.0.0
+
+# Note: tkinter is usually included with Python
+# If not available, install python3-tk on Linux: sudo apt-get install python3-tk
