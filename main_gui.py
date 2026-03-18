@@ -261,10 +261,10 @@ class YouTubeDownloaderGUI:
         self.naming_combo = ttk.Combobox(options_frame, width=10, state='readonly')
         self.naming_combo['values'] = ('YouTube (with ID)', 'Simple (name only)')
         self.naming_combo.current(0)  # YouTube style
-        # Thumbnails: Don't download by default (save bandwidth & speed)
-        self.download_thumbnails_var = tk.BooleanVar(value=False)
-        # Subtitles: Don't download by default (save bandwidth & speed)
-        self.download_subtitles_var = tk.BooleanVar(value=False)
+        # Thumbnails: Download by default
+        self.download_thumbnails_var = tk.BooleanVar(value=True)
+        # Subtitles: Download by default
+        self.download_subtitles_var = tk.BooleanVar(value=True)
         # Only subtitles: Download only subtitles without video
         self.only_subtitles_var = tk.BooleanVar(value=False)
         # Quality: Default to 720p for balance between speed and quality
@@ -1245,13 +1245,13 @@ class YouTubeDownloaderGUI:
                 # Set proper output template for subtitles
                 if only_subtitles:
                     # For subtitle-only mode, put subtitles in subtitles folder
-                    subtitle_opts['outtmpl'] = subtitle_base_path
+                    subtitle_opts['outtmpl'] = f"{subtitle_base_path}.%(ext)s"
                     subtitle_opts['skip_download'] = True  # Don't download video
                 else:
                     # For normal mode with subtitles, specify both video and subtitle paths
                     subtitle_opts['outtmpl'] = {
                         'default': f"{base_path}.%(ext)s",  # Video output
-                        'subtitle': subtitle_base_path,  # Subtitle output (in separate folder)
+                        'subtitle': f"{subtitle_base_path}.%(ext)s",  # Subtitle output (in separate folder)
                     }
                 
                 ydl_opts.update(subtitle_opts)
