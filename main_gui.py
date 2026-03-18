@@ -6,6 +6,7 @@ import queue
 from datetime import datetime
 import json
 import time
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Import từ main.py
@@ -32,6 +33,61 @@ try:
     YT_DLP_AVAILABLE = True
 except ImportError:
     YT_DLP_AVAILABLE = False
+
+
+# ========== SRT SUBTITLE CLEANING FUNCTIONS (from tool.py) ==========
+def time_to_ms(t):
+    """Convert SRT time format to milliseconds"""
+    hms, ms = t.split(',')
+    h, m, s = map(int, hms.split(':'))
+    return (h*3600 + m*60 + s) * 1000 + int(ms)
+
+def ms_to_time(ms):
+    """Convert milliseconds to SRT time format"""
+    h = ms // 3600000
+    ms %= 3600000
+    m = ms // 60000
+    ms %= 60000
+    s = ms // 1000
+    ms %= 1000
+    return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+def clean_srt(input_file, output_file):
+    """Clean and format SRT subtitle file - fixes overlapping timestamps"""
+    subs = []
+
+    with open(input_file, "r", encoding="utf-8", errors="ignore") as f:
+        blocks = f.read().strip().split("\n\n")
+
+    for block in blocks:
+        lines = block.split("\n")
+        if len(lines) < 2:
+            continue
+
+        if "-->" not in lines[1]:
+            continue
+
+        start, end = lines[1].split(" --> ")
+        text = " ".join(lines[2:])
+
+        try:
+            start_ms = time_to_ms(start.strip())
+            end_ms = time_to_ms(end.strip())
+            subs.append([start_ms, end_ms, text])
+        except:
+            continue
+
+    # Fix overlapping timestamps
+    for i in range(1, len(subs)):
+        if subs[i][0] < subs[i-1][1]:
+            subs[i][0] = subs[i-1][1] + 10
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        for i, (start, end, text) in enumerate(subs, 1):
+            f.write(f"{i}\n")
+            f.write(f"{ms_to_time(start)} --> {ms_to_time(end)}\n")
+            f.write(f"{text}\n\n")
+# ========== END SRT CLEANING FUNCTIONS ==========
 
 
 class YouTubeDownloaderGUI:
@@ -142,7 +198,7 @@ class YouTubeDownloaderGUI:
         left_panel = ttk.Frame(main_frame, padding="5")
         left_panel.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5))
         left_panel.columnconfigure(0, weight=1)
-        left_panel.rowconfigure(6, weight=1)  # Log section expands
+        left_panel.rowconfigure(7, weight=1)  # Log section expands
         
         # Title with YouTube logo
         title_label = ttk.Label(left_panel, text="▶️ YouTube Downloader", style='Title.TLabel')
@@ -205,12 +261,16 @@ class YouTubeDownloaderGUI:
         self.naming_combo = ttk.Combobox(options_frame, width=10, state='readonly')
         self.naming_combo['values'] = ('YouTube (with ID)', 'Simple (name only)')
         self.naming_combo.current(0)  # YouTube style
-        # Thumbnails: Always download
-        self.download_thumbnails_var = tk.BooleanVar(value=True)
-        # Quality: Always Highest
+        # Thumbnails: Don't download by default (save bandwidth & speed)
+        self.download_thumbnails_var = tk.BooleanVar(value=False)
+        # Subtitles: Don't download by default (save bandwidth & speed)
+        self.download_subtitles_var = tk.BooleanVar(value=False)
+        # Only subtitles: Download only subtitles without video
+        self.only_subtitles_var = tk.BooleanVar(value=False)
+        # Quality: Default to 720p for balance between speed and quality
         self.quality_combo = ttk.Combobox(options_frame, width=10, state='readonly')
         self.quality_combo['values'] = ('Highest', 'Lowest', '1080p', '720p', '480p', '360p', '240p')
-        self.quality_combo.current(0)  # Highest
+        self.quality_combo.current(3)  # 720p - recommended for speed
         
         # Min views filter
         ttk.Label(options_frame, text="📈 Min Views:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5), pady=3)
@@ -218,31 +278,124 @@ class YouTubeDownloaderGUI:
         self.min_views_entry.grid(row=0, column=1, sticky=tk.W, pady=3)
         self.min_views_entry.insert(0, "0")
         
+        # Start from video number
+        ttk.Label(options_frame, text="▶️ Start From:").grid(row=0, column=2, sticky=tk.W, padx=(10, 5), pady=3)
+        self.start_from_entry = ttk.Entry(options_frame, width=10)
+        self.start_from_entry.grid(row=0, column=3, sticky=tk.W, pady=3)
+        self.start_from_entry.insert(0, "1")
+        # Bind event to update video list when number changes
+        self.start_from_entry.bind('<KeyRelease>', lambda e: self.update_video_list_delayed())
+        self.start_from_entry.bind('<FocusOut>', lambda e: self.update_video_list())
+        
         # Number of videos to download
-        ttk.Label(options_frame, text="⬇️ Download:").grid(row=0, column=2, sticky=tk.W, padx=(10, 5), pady=3)
+        ttk.Label(options_frame, text="⬇️ Download:").grid(row=1, column=2, sticky=tk.W, padx=(10, 5), pady=3)
         self.num_download_entry = ttk.Entry(options_frame, width=10)
-        self.num_download_entry.grid(row=0, column=3, sticky=tk.W, pady=3)
+        self.num_download_entry.grid(row=1, column=3, sticky=tk.W, pady=3)
         self.num_download_entry.insert(0, "5")
         # Bind event to update video list when number changes
         self.num_download_entry.bind('<KeyRelease>', lambda e: self.update_video_list_delayed())
         self.num_download_entry.bind('<FocusOut>', lambda e: self.update_video_list())
         
         # Sort by
-        ttk.Label(options_frame, text="📊 Sort:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5), pady=3)
+        ttk.Label(options_frame, text="📊 Sort:").grid(row=2, column=0, sticky=tk.W, padx=(0, 5), pady=3)
         self.sort_combo = ttk.Combobox(options_frame, width=15, state='readonly')
         self.sort_combo['values'] = ('Views (High to Low)', 'Views (Low to High)', 
                                      'Date (Newest)', 'Date (Oldest)', 
                                      'Duration (Longest)', 'Duration (Shortest)',
                                      'Title (A-Z)')
         self.sort_combo.current(0)
-        self.sort_combo.grid(row=1, column=1, sticky=tk.W, pady=3)
+        self.sort_combo.grid(row=2, column=1, sticky=tk.W, pady=3)
         
         # Threads for parallel download
-        ttk.Label(options_frame, text="⚡ Threads:").grid(row=1, column=2, sticky=tk.W, padx=(10, 5), pady=3)
+        ttk.Label(options_frame, text="⚡ Threads:").grid(row=2, column=2, sticky=tk.W, padx=(10, 5), pady=3)
         self.threads_combo = ttk.Combobox(options_frame, width=8, state='readonly')
         self.threads_combo['values'] = ('1', '2', '3', '4', '5', '8', '10')
         self.threads_combo.current(2)  # Default: 3 threads
-        self.threads_combo.grid(row=1, column=3, sticky=tk.W, pady=3)
+        self.threads_combo.grid(row=2, column=3, sticky=tk.W, pady=3)
+        
+        # Download subtitles option
+        self.subtitles_check = ttk.Checkbutton(options_frame, text="📝 Download Subtitles (SRT)", 
+                                               variable=self.download_subtitles_var)
+        self.subtitles_check.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=3)
+        
+        # Only subtitles option (no video)
+        self.only_subtitles_check = ttk.Checkbutton(options_frame, text="📄 Only Subtitles (No Video)", 
+                                                    variable=self.only_subtitles_var)
+        self.only_subtitles_check.grid(row=3, column=2, columnspan=2, sticky=tk.W, pady=3, padx=(10, 0))
+        
+        # Subtitle language selection
+        ttk.Label(options_frame, text="🌐 Sub Lang:").grid(row=4, column=0, sticky=tk.W, padx=(0, 5), pady=3)
+        self.subtitle_lang_combo = ttk.Combobox(options_frame, width=15, state='readonly')
+        self.subtitle_lang_combo['values'] = (
+            'Vietnamese (vi)',
+            'English (en)', 
+            'Vietnamese + English',
+            'Japanese (ja)',
+            'Korean (ko)',
+            'Chinese-Simp (zh-Hans)',
+            'Chinese-Trad (zh-Hant)',
+            'Spanish (es)',
+            'French (fr)',
+            'German (de)',
+            'Thai (th)',
+            'Indonesian (id)',
+            'Portuguese (pt)',
+            'Russian (ru)',
+            'Arabic (ar)'
+        )
+        self.subtitle_lang_combo.current(2)  # Default: Vietnamese + English
+        self.subtitle_lang_combo.grid(row=4, column=1, sticky=tk.W, pady=3)
+        
+        # Info label for subtitle languages
+        ttk.Label(options_frame, text="💡 Tip: Multi-language may be slower", 
+                 foreground=self.colors['warning'], font=('Segoe UI', 7)).grid(row=4, column=2, columnspan=2, sticky=tk.W, pady=3, padx=(10, 0))
+        
+        # Auto-format SRT option
+        self.auto_format_srt_var = tk.BooleanVar(value=True)  # Default: Auto-format enabled
+        self.auto_format_check = ttk.Checkbutton(options_frame, text="🔧 Auto-format SRT (fix timestamps)", 
+                                                 variable=self.auto_format_srt_var)
+        self.auto_format_check.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=3)
+        
+        ttk.Label(options_frame, text="💡 Automatically clean & format after download", 
+                 foreground=self.colors['success'], font=('Segoe UI', 7)).grid(row=5, column=2, columnspan=2, sticky=tk.W, pady=3, padx=(10, 0))
+        
+        # Anti-bot options
+        ttk.Label(options_frame, text="").grid(row=6, column=0, sticky=tk.W, padx=(0, 5), pady=3)
+        self.cookies_browser_combo = ttk.Combobox(options_frame, width=15, state='readonly')
+        self.cookies_browser_combo['values'] = (
+            'None (Not Recommended)',
+            'Chrome (Recommended)',
+            'Edge (Recommended)',
+            'Firefox', 
+            'Safari',
+            'Brave',
+            'Chromium',
+            'Opera'
+        )
+        self.cookies_browser_combo.current(0)  # Default: None
+        # Browser cookies UI hidden by default; keep widget for compatibility.
+        
+        ttk.Label(options_frame, text="", 
+                 foreground=self.colors['error'], font=('Segoe UI', 7, 'bold')).grid(row=6, column=2, columnspan=2, sticky=tk.W, pady=3, padx=(10, 0))
+        
+        # Cookies.txt file option (alternative method)
+        ttk.Label(options_frame, text="📄 Cookie File:").grid(row=6, column=0, sticky=tk.W, padx=(0, 5), pady=3)
+        cookies_file_frame = ttk.Frame(options_frame)
+        cookies_file_frame.grid(row=6, column=1, sticky=(tk.W, tk.E), pady=3)
+        cookies_file_frame.columnconfigure(0, weight=1)
+        
+        self.cookies_file_entry = ttk.Entry(cookies_file_frame, font=('Segoe UI', 8), foreground='gray')
+        self.cookies_file_entry.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 3))
+        self.cookies_file_entry.insert(0, "Optional cookies.txt file...")
+        self.cookies_file_entry.bind('<FocusIn>', self.on_cookies_file_focus_in)
+        self.cookies_file_entry.bind('<FocusOut>', self.on_cookies_file_focus_out)
+        self.cookies_file_placeholder = True
+        
+        browse_cookies_btn = ttk.Button(cookies_file_frame, text="📁", command=self.browse_cookies_file, width=3)
+        browse_cookies_btn.grid(row=0, column=1)
+        
+        ttk.Label(options_frame, text="💡 Default method: import cookies.txt", 
+                 foreground=self.colors['success'], font=('Segoe UI', 7)).grid(row=6, column=2, columnspan=2, sticky=tk.W, pady=3, padx=(10, 0))
         
         # === ACTION BUTTONS SECTION ===
         buttons_frame = ttk.Frame(left_panel)
@@ -269,9 +422,27 @@ class YouTubeDownloaderGUI:
                                    style='TButton', state='disabled')
         self.stop_btn.grid(row=0, column=2, sticky=(tk.W, tk.E), padx=(3, 0))
         
+        # === SRT TOOLS SECTION (Row 2) ===
+        srt_frame = ttk.Frame(left_panel)
+        srt_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=(5, 5))
+        srt_frame.columnconfigure(0, weight=1)
+        srt_frame.columnconfigure(1, weight=1)
+        
+        # Clean SRT button
+        self.clean_srt_btn = ttk.Button(srt_frame, text="🔧 Format SRT File", 
+                                        command=self.clean_srt_file_dialog, 
+                                        style='TButton')
+        self.clean_srt_btn.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 3))
+        
+        # Clean All SRT button
+        self.clean_all_srt_btn = ttk.Button(srt_frame, text="🔧 Format All SRT", 
+                                            command=self.clean_all_srt_files, 
+                                            style='TButton')
+        self.clean_all_srt_btn.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(3, 0))
+        
         # === PROGRESS SECTION ===
         progress_frame = ttk.Frame(left_panel)
-        progress_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
+        progress_frame.grid(row=6, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
         progress_frame.columnconfigure(0, weight=1)
         
         self.progress_label = ttk.Label(progress_frame, text="Ready", foreground=self.colors['accent'])
@@ -282,7 +453,7 @@ class YouTubeDownloaderGUI:
         
         # === LOG SECTION ===
         log_frame = ttk.LabelFrame(left_panel, text=" Log ", padding="5")
-        log_frame.grid(row=6, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 5))
+        log_frame.grid(row=7, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 5))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         
@@ -306,9 +477,10 @@ class YouTubeDownloaderGUI:
         
         self.log("▶️ Welcome to YouTube Channel Video Downloader!", 'accent')
         self.log("Enter a YouTube channel URL to get started.", 'info')
-        self.log("\n✅ Using Auto-Detect Mode (Best for 1080p quality)", 'success')
-        self.log("   → Automatically selects best client for each video", 'info')
-        self.log("   → No cookies needed - maximum compatibility!\n", 'success')
+        self.log("\n🚀 SPEED OPTIMIZED MODE - Fast download with full quality!", 'success')
+        self.log("   → 3x concurrent fragments + 10MB chunks", 'info')
+        self.log("   → Smart retries + Fast thumbnails (HQ)", 'info')
+        self.log("   → Audio guaranteed + 1080p priority\n", 'success')
         
         # Check if yt-dlp is available
         if YT_DLP_AVAILABLE:
@@ -344,6 +516,41 @@ class YouTubeDownloaderGUI:
         else:
             self.log("⚠️ yt-dlp not found - using pytube (may have compatibility issues)", 'warning')
             self.log("💡 For better results, install yt-dlp: pip install yt-dlp", 'info')
+        
+        # Important notes about subtitles and rate limiting
+        self.log("\n📝 SUBTITLE DOWNLOAD FEATURE:", 'accent')
+        self.log("   → Choose language: Vietnamese, English, Japanese, Korean, etc.", 'info')
+        self.log("   → Option: Download only subtitles (skip video)", 'info')
+        self.log("   ⚠️ RATE LIMIT: Use 1-2 threads for subtitle-only mode", 'warning')
+        self.log("   💡 If you see '429 errors', select single language only", 'info')
+        
+        # SRT formatting feature
+        self.log("\n🔧 SRT FORMATTING TOOLS:", 'accent')
+        self.log("   ✅ Auto-format enabled by default (fixes timestamps automatically)", 'success')
+        self.log("   → Format single SRT file (manual)", 'info')
+        self.log("   → Format all SRT files in subtitles folder (manual)", 'info')
+        self.log("   💡 SRT files are cleaned automatically after download", 'info')
+        
+        # Anti-bot feature
+        self.log("\n🔒 ANTI-BOT PROTECTION:", 'accent')
+        self.log("   ⚠️ IMPORTANT: YouTube is blocking downloads without cookies!", 'error')
+        self.log("   ✅ Multi-client fallback (Android/iOS/Web/Mobile)", 'success')
+        self.log("   🔑 Cookies REQUIRED for most videos:", 'warning')
+        self.log("   ", 'info')
+        self.log("   📋 METHOD 1 - Browser Cookies (Easiest):", 'accent')
+        self.log("      1️⃣ Open Chrome/Edge and LOGIN to YouTube", 'info')
+        self.log("      2️⃣ CLOSE Chrome/Edge completely (important!)", 'warning')
+        self.log("      3️⃣ In app: Select 'Cookies: Chrome' or 'Edge'", 'info')
+        self.log("      4️⃣ Click Download", 'success')
+        self.log("   ", 'info')
+        self.log("   📋 METHOD 2 - Cookies.txt File (Alternative):", 'accent')
+        self.log("      1️⃣ Install extension: 'Get cookies.txt LOCALLY'", 'info')
+        self.log("      2️⃣ Visit YouTube.com and export cookies.txt", 'info')
+        self.log("      3️⃣ In app: Click 📁 button next to 'Cookie File'", 'info')
+        self.log("      4️⃣ Select your cookies.txt file", 'success')
+        self.log("   ", 'info')
+        self.log("   💡 Cookies.txt file = No need to close browser!", 'success')
+        self.log("   ", 'info')
         
         # === RIGHT PANEL: VIDEO LIST ===
         right_panel = ttk.Frame(main_frame, padding="5")
@@ -434,6 +641,65 @@ class YouTubeDownloaderGUI:
             self.path_entry.config(foreground='gray')
             self.path_placeholder = True
     
+    def on_cookies_file_focus_in(self, event):
+        """Clear placeholder text when cookies file entry is focused"""
+        if self.cookies_file_placeholder:
+            self.cookies_file_entry.delete(0, tk.END)
+            self.cookies_file_entry.config(foreground=self.colors['fg'])
+            self.cookies_file_placeholder = False
+    
+    def on_cookies_file_focus_out(self, event):
+        """Restore placeholder if entry is empty"""
+        if not self.cookies_file_entry.get().strip():
+            self.cookies_file_entry.insert(0, "Optional cookies.txt file...")
+            self.cookies_file_entry.config(foreground='gray')
+            self.cookies_file_placeholder = True
+    
+    def browse_cookies_file(self):
+        """Open file dialog to select cookies.txt file"""
+        file_path = filedialog.askopenfilename(
+            title="Select Cookies File",
+            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")]
+        )
+        
+        if file_path:
+            # Clear placeholder if needed
+            if self.cookies_file_placeholder:
+                self.cookies_file_entry.delete(0, tk.END)
+                self.cookies_file_entry.config(foreground=self.colors['fg'])
+                self.cookies_file_placeholder = False
+            else:
+                self.cookies_file_entry.delete(0, tk.END)
+            
+            self.cookies_file_entry.insert(0, file_path)
+            self.log(f"✅ Cookies file selected: {file_path}", 'success')
+    
+    def resolve_cookie_source(self, log_missing=True):
+        """Resolve cookies.txt file or browser cookies from the current UI state"""
+        cookies_file_path = None
+
+        if not self.cookies_file_placeholder and self.cookies_file_entry.get().strip():
+            cookies_file_path = self.cookies_file_entry.get().strip().strip('"').strip("'")
+            if not os.path.exists(cookies_file_path):
+                if log_missing:
+                    self.queue_log(f"   âš ï¸ Cookies file not found: {cookies_file_path}", 'warning')
+                    self.queue_log(f"   â†’ Ignoring cookies file...", 'info')
+                cookies_file_path = None
+
+        browser_map = {
+            0: None,
+            1: 'chrome',
+            2: 'edge',
+            3: 'firefox',
+            4: 'safari',
+            5: 'brave',
+            6: 'chromium',
+            7: 'opera'
+        }
+        selected_browser = browser_map.get(self.cookies_browser_combo.current())
+
+        return cookies_file_path, selected_browser
+
     def on_cookies_focus_in(self, event):
         """Cookies feature removed - no-op function for compatibility"""
         pass
@@ -531,7 +797,8 @@ class YouTubeDownloaderGUI:
             
             # Get cookies file if provided AND enabled
             self.cookies_file = None
-            if self.use_cookies_var.get():  # Only use cookies if checkbox is enabled
+            self.cookies_file, selected_browser = self.resolve_cookie_source()
+            if False:  # Legacy cookies UI removed
                 cookies_text = self.cookies_entry.get().strip()
                 if cookies_text and not self.cookies_placeholder and 'Optional' not in cookies_text:
                     cookies_path = cookies_text.strip('"').strip("'")
@@ -561,7 +828,12 @@ class YouTubeDownloaderGUI:
             # Try yt-dlp first if available
             if YT_DLP_AVAILABLE:
                 self.queue_log("📡 Using yt-dlp (more reliable)...", 'info')
-                channel_info = self.get_channel_info_ytdlp(channel_url, download_path)
+                channel_info = self.get_channel_info_ytdlp(
+                    channel_url,
+                    download_path,
+                    self.cookies_file,
+                    selected_browser
+                )
                 if channel_info and channel_info.get('status') != 'error':
                     return
             
@@ -579,6 +851,53 @@ class YouTubeDownloaderGUI:
             self.progress_label.config(text="Ready")
             self.get_info_btn.config(state='normal')
     
+    def get_channel_info(self):
+        """Get channel information"""
+        try:
+            self.get_info_btn.config(state='disabled')
+            self.download_btn.config(state='disabled')
+            self.progress_bar.start()
+            self.progress_label.config(text="Fetching channel information...")
+
+            channel_url = self.clean_channel_url(self.url_entry.get())
+            download_path = self.path_entry.get().strip().strip('"').strip("'")
+            self.cookies_file, selected_browser = self.resolve_cookie_source()
+
+            if not channel_url:
+                self.queue_log("âŒ Please enter a valid YouTube channel URL!", 'error')
+                self.queue_log("   Example: https://www.youtube.com/@channelname", 'warning')
+                return
+
+            if not download_path:
+                self.queue_log("âŒ Please select a download folder first!", 'error')
+                self.queue_log("   Click Browse button to choose folder", 'warning')
+                return
+
+            self.queue_log(f"ðŸ” Fetching info from: {channel_url}", 'info')
+
+            if YT_DLP_AVAILABLE:
+                self.queue_log("ðŸ“¡ Using yt-dlp (more reliable)...", 'info')
+                channel_info = self.get_channel_info_ytdlp(
+                    channel_url,
+                    download_path,
+                    self.cookies_file,
+                    selected_browser
+                )
+                if channel_info and channel_info.get('status') != 'error':
+                    return
+
+            self.queue_log("âŒ yt-dlp is required for this application!", 'error')
+            self.queue_log("\nðŸ’¡ Please install yt-dlp:", 'warning')
+            self.queue_log("   pip install yt-dlp", 'info')
+            self.queue_log("   Then restart the application.", 'info')
+
+        except Exception as e:
+            self.queue_log(f"âŒ Error: {str(e)}", 'error')
+        finally:
+            self.progress_bar.stop()
+            self.progress_label.config(text="Ready")
+            self.get_info_btn.config(state='normal')
+
     def filter_videos(self):
         """Filter and sort videos"""
         try:
@@ -665,12 +984,17 @@ class YouTubeDownloaderGUI:
                 self.video_list_info.config(text="No videos after filtering.", foreground=self.colors['warning'])
                 return
             
-            # Get number of videos to download
+            # Get start position and number of videos to download
+            start_from = max(1, int(self.start_from_entry.get() or 1))
+            start_index = start_from - 1  # Convert to 0-based index
             requested_count = int(self.num_download_entry.get() or len(self.filtered_videos))
-            num_to_show = min(requested_count, len(self.filtered_videos))
+            
+            # Calculate how many videos to show from the start position
+            available_from_start = len(self.filtered_videos) - start_index
+            num_to_show = min(requested_count, max(0, available_from_start))
             
             # Populate video list - ONLY show videos that will be downloaded
-            for i, video in enumerate(self.filtered_videos[:num_to_show], 1):
+            for i, video in enumerate(self.filtered_videos[start_index:start_index + num_to_show], start_from):
                 title = video.get('title', 'Unknown')[:50]
                 views = video.get('views') or 0
                 views_str = f"{views:,}".replace(',', '.')
@@ -685,9 +1009,10 @@ class YouTubeDownloaderGUI:
                 video['tree_item_id'] = item_id
             
             # Update info label
-            if num_to_show < len(self.filtered_videos):
+            if start_index > 0 or num_to_show < len(self.filtered_videos):
+                end_index = start_index + num_to_show
                 self.video_list_info.config(
-                    text=f"📊 Showing {num_to_show} videos (of {len(self.filtered_videos)} available) - ready to download",
+                    text=f"📊 Showing videos #{start_from}-{start_from + num_to_show - 1} (of {len(self.filtered_videos)} total after filter) - ready to download",
                     foreground=self.colors['success']
                 )
             else:
@@ -751,7 +1076,7 @@ class YouTubeDownloaderGUI:
             self.queue_log("   Current downloads will finish, new ones will be cancelled.", 'info')
             self.stop_btn.config(state='disabled')
     
-    def _download_single_video(self, i, video_info, quality, naming_style, download_thumbnails, num_to_download):
+    def _download_single_video(self, i, video_info, quality, naming_style, download_thumbnails, download_subtitles, only_subtitles, subtitle_langs, num_to_download):
         """Download a single video (called by ThreadPoolExecutor)"""
         try:
             self.queue_log(f"\n[{i}/{num_to_download}] {video_info['title'][:60]}", 'accent')
@@ -765,108 +1090,424 @@ class YouTubeDownloaderGUI:
             video_filename = f"{base_filename}.mp4"
             video_full_path = os.path.join(self.downloader.video_path, video_filename)
             
-            # Check if exists
-            if os.path.exists(video_full_path):
-                file_size = os.path.getsize(video_full_path) / (1024 * 1024)
-                self.queue_log(f"   ⏭️ File already exists ({file_size:.1f} MB), skipping...", 'warning')
-                self.root.after(0, lambda: self.update_video_progress(video_info, 'skipped'))
-                return {'status': 'skipped', 'title': video_info['title'], 'filesize_mb': file_size}
+            # If only subtitles mode, skip video existence check
+            if not only_subtitles:
+                # Check if exists
+                if os.path.exists(video_full_path):
+                    file_size = os.path.getsize(video_full_path) / (1024 * 1024)
+                    self.queue_log(f"   ⏭️ File already exists ({file_size:.1f} MB), skipping...", 'warning')
+                    self.root.after(0, lambda: self.update_video_progress(video_info, 'skipped'))
+                    return {'status': 'skipped', 'title': video_info['title'], 'filesize_mb': file_size}
             
-            # Download thumbnail first
-            if download_thumbnails:
+            # Download thumbnail first (skip if only subtitles mode)
+            if download_thumbnails and not only_subtitles:
                 self.root.after(0, lambda: self.update_video_progress(video_info, 'downloading', '🖼️ Thumbnail...'))
                 self.queue_log(f"   🖼️ Downloading thumbnail...", 'info')
                 thumbnail_path = self.download_thumbnail_manual(video_info, sequence_number=i)
                 if thumbnail_path:
                     self.queue_log(f"   ✅ Thumbnail saved", 'success')
             
-            # Download video with yt-dlp
-            self.root.after(0, lambda: self.update_video_progress(video_info, 'downloading', '⬇️ Downloading...'))
-            self.queue_log(f"   🎬 Downloading video...", 'info')
+            # Add random delay to avoid rate limiting (especially for only_subtitles mode)
+            if only_subtitles:
+                # Longer delay for subtitle-only mode to avoid 429 errors
+                delay = random.uniform(5.0, 10.0)  # Increased from 2-5s to 5-10s
+                self.queue_log(f"   ⏳ Waiting {delay:.1f}s to avoid rate limiting...", 'info')
+                time.sleep(delay)
+            else:
+                # Shorter delay for normal mode
+                delay = random.uniform(1.0, 2.0)  # Increased from 0.5-1.5s
+                time.sleep(delay)
+            
+            # Download video with yt-dlp (or only subtitles)
+            if only_subtitles:
+                self.root.after(0, lambda: self.update_video_progress(video_info, 'downloading', '📝 Subtitles...'))
+                self.queue_log(f"   📝 Downloading subtitles only...", 'info')
+            else:
+                self.root.after(0, lambda: self.update_video_progress(video_info, 'downloading', '⬇️ Downloading...'))
+                self.queue_log(f"   🎬 Downloading video...", 'info')
             
             if not YT_DLP_AVAILABLE:
                 self.queue_log(f"   ❌ yt-dlp not available", 'error')
                 self.root.after(0, lambda: self.update_video_progress(video_info, 'error'))
                 return {'status': 'error', 'message': 'yt-dlp not available'}
             
-            # Format selection - Ensure audio is always included
-            # Priority: 1080p with audio > 720p with audio > best available with audio > best overall
-            if quality == 'highest':
-                format_str = 'bestvideo[height>=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height>=1080]+bestaudio/bestvideo[height>=720]+bestaudio/bestvideo*+bestaudio/best'
+            # Format selection - 720p optimized (faster than best)
+            # Skip checking higher resolutions, go straight to 720p
+            if only_subtitles:
+                format_str = 'best[ext=mp4]/best'  # Simple format for subtitle-only
             elif quality == 'lowest':
-                format_str = 'worstvideo+worstaudio/worst'
+                format_str = 'worstvideo*+worstaudio/worst'
+            elif quality in ['720p', 'highest', '1080p']:
+                # 720p or higher → optimized to find 720p fast without checking 1080p
+                format_str = 'bestvideo[height=720]+bestaudio/bestvideo[height<=720]+bestaudio/best'
             else:
+                # Other qualities
                 height = quality.replace('p', '')
-                format_str = f'bestvideo[height>={height}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height>={height}]+bestaudio/bestvideo*+bestaudio/best'
+                format_str = f'bestvideo[height={height}]+bestaudio/bestvideo[height<={height}]+bestaudio/best'
             
-            # yt-dlp options - AUTO DETECT mode with proper audio/video merge
+            # yt-dlp options - Optimized for speed while maintaining quality
             # Force mp4 output format and ensure ffmpeg is used for merging
             base_path = video_full_path.rsplit('.', 1)[0]  # Remove .mp4 extension
+            
+            # Create subtitle path with same filename pattern
+            subtitle_base_path = os.path.join(self.downloader.subtitles_path, base_filename)
+            
+            # Get cookies file if provided (priority over browser cookies)
+            cookies_file_path = None
+            if not self.cookies_file_placeholder and self.cookies_file_entry.get().strip():
+                cookies_file_path = self.cookies_file_entry.get().strip()
+                if not os.path.exists(cookies_file_path):
+                    self.queue_log(f"   ⚠️ Cookies file not found: {cookies_file_path}", 'warning')
+                    self.queue_log(f"   → Ignoring cookies file...", 'info')
+                    cookies_file_path = None
+            
+            # Get cookies browser selection (used if no cookies file)
+            cookies_browser_idx = self.cookies_browser_combo.current()
+            browser_map = {
+                0: None,  # None
+                1: 'chrome',
+                2: 'edge',
+                3: 'firefox',
+                4: 'safari',
+                5: 'brave',
+                6: 'chromium',
+                7: 'opera'
+            }
+            selected_browser = browser_map.get(cookies_browser_idx)
+            
             ydl_opts = {
                 'format': format_str,
-                'outtmpl': base_path,  # Without extension
+                'outtmpl': f"{base_path}.%(ext)s",  # Let yt-dlp write the real extension
                 'merge_output_format': 'mp4',  # Force merge to mp4
-                'postprocessors': [{  # Ensure audio is embedded
-                    'key': 'FFmpegVideoConvertor',
-                    'preferedformat': 'mp4',
-                }],
+                'postprocessors': [],  # Removed FFmpeg post-processor for speed
                 'keepvideo': False,  # Remove separate streams after merge
                 'quiet': False,
                 'no_warnings': False,
                 'nocheckcertificate': True,
                 'ignoreerrors': False,
                 'no_color': True,
-                'extractor_retries': 5,
-                'fragment_retries': 10,
+                # ULTRA-FAST optimizations
+                'extractor_retries': 1,  # Single retry only
+                'fragment_retries': 1,   # Single retry, fast fail
+                'retries': 1,            # Single retry
+                'concurrent_fragment_downloads': 20,  # Download 20 fragments in parallel
+                'http_chunk_size': 104857600,  # 100MB chunks for fastest download
                 'skip_unavailable_fragments': True,
-                'retries': 10,
+                'socket_timeout': 30,  # 30 second timeout
                 'geo_bypass': True,
                 'geo_bypass_country': 'US',
+                # Anti-bot detection - Use multiple YouTube clients for better success
+                'extractor_args': {
+                    'youtube': {}
+                },
+                # User-agent to mimic real browser
+                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             }
             
-            # Download with yt-dlp
-            import yt_dlp
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(video_info['url'], download=True)
+            # Add cookies - Priority: cookies file > browser cookies
+            cookies_loaded = False
+            cookies_source = None
+            
+            if cookies_file_path:
+                # Use cookies from file (highest priority)
+                ydl_opts['cookiefile'] = cookies_file_path
+                cookies_loaded = True
+                cookies_source = 'file'
+                self.queue_log(f"   🔒 Using cookies from file: {os.path.basename(cookies_file_path)}", 'success')
+            elif selected_browser:
+                # Use cookies from browser (fallback)
+                ydl_opts['cookiesfrombrowser'] = (selected_browser,)
+                cookies_loaded = True
+                cookies_source = 'browser'
+                self.queue_log(f"   🔒 Attempting to use cookies from {selected_browser.capitalize()}...", 'info')
+            
+            # Subtitle-only mode should not request video formats or video postprocessing
+            if only_subtitles:
+                if not cookies_loaded:
+                    ydl_opts['extractor_args']['youtube']['player_client'] = ['android']
+                for key in ['format', 'merge_output_format', 'postprocessors', 'keepvideo',
+                            'concurrent_fragment_downloads', 'http_chunk_size']:
+                    if key in ydl_opts:
+                        del ydl_opts[key]
+            elif not cookies_loaded:
+                ydl_opts['extractor_args']['youtube']['player_client'] = ['android']
+
+            # Add subtitle options if enabled
+            if download_subtitles:
+                subtitle_opts = {
+                    'writesubtitles': True,  # Download manual subtitles
+                    'writeautomaticsub': True,  # Download auto-generated subtitles
+                    'subtitleslangs': subtitle_langs,  # Use selected languages
+                    'subtitlesformat': 'srt',  # SRT format
+                    'sleep_interval_subtitles': 5,  # Wait 5s between subtitle requests
+                }
                 
-                # Get file size
-                file_size = 0
-                if os.path.exists(video_full_path):
-                    file_size = os.path.getsize(video_full_path) / (1024 * 1024)  # Convert to MB
-                    self.queue_log(f"   ✅ Downloaded: {file_size:.1f} MB", 'success')
+                # Set proper output template for subtitles
+                if only_subtitles:
+                    # For subtitle-only mode, put subtitles in subtitles folder
+                    subtitle_opts['outtmpl'] = subtitle_base_path
+                    subtitle_opts['skip_download'] = True  # Don't download video
+                else:
+                    # For normal mode with subtitles, specify both video and subtitle paths
+                    subtitle_opts['outtmpl'] = {
+                        'default': f"{base_path}.%(ext)s",  # Video output
+                        'subtitle': subtitle_base_path,  # Subtitle output (in separate folder)
+                    }
+                
+                ydl_opts.update(subtitle_opts)
+                
+                # Log message
+                lang_names = ', '.join(subtitle_langs)
+                if only_subtitles:
+                    self.queue_log(f"   📝 Downloading subtitles ({lang_names}) to subtitles folder...", 'info')
+                else:
+                    self.queue_log(f"   📝 Downloading subtitles ({lang_names}) to subtitles folder...", 'info')
+            
+            # Download with yt-dlp (with retry logic for 429 errors and cookie errors)
+            import yt_dlp
+            
+            max_retries = 3
+            retry_count = 0
+            last_error = None
+            cookie_error_retried = False  # Track if we already retried without cookies
+            
+            while retry_count < max_retries:
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(video_info['url'], download=True)
+                        
+                    # Success! Log if we used cookies successfully
+                    if cookies_loaded:
+                        if cookies_source == 'file':
+                            self.queue_log(f"   ✅ Successfully used cookies from file", 'success')
+                        elif cookies_source == 'browser' and 'cookiesfrombrowser' in ydl_opts:
+                            self.queue_log(f"   ✅ Successfully used {selected_browser.capitalize()} cookies", 'success')
+                    
+                    # Success! Break out of retry loop
+                    break
+                    
+                except Exception as e:
+                    error_msg = str(e)
+                    last_error = e
+                    
+                    # Check if it's a bot detection error
+                    if 'Sign in to confirm' in error_msg or 'not a bot' in error_msg:
+                        if not cookies_loaded:
+                            # No cookies used, suggest using cookies
+                            self.queue_log(f"   🤖 BOT DETECTION! YouTube requires authentication.", 'error')
+                            self.queue_log(f"   ", 'error')
+                            self.queue_log(f"   ⚠️ SOLUTION - Choose ONE method:", 'warning')
+                            self.queue_log(f"   ", 'warning')
+                            self.queue_log(f"   📌 METHOD 1 (Easiest): Use Browser Cookies", 'accent')
+                            self.queue_log(f"      1. Open Chrome/Edge and login to YouTube", 'info')
+                            self.queue_log(f"      2. CLOSE Chrome/Edge completely", 'warning')
+                            self.queue_log(f"      3. In app: Select 'Cookies: Chrome/Edge (Recommended)'", 'info')
+                            self.queue_log(f"      4. Retry download", 'success')
+                            self.queue_log(f"   ", 'info')
+                            self.queue_log(f"   📌 METHOD 2 (Alternative): Use cookies.txt file", 'accent')
+                            self.queue_log(f"      1. Install extension: 'Get cookies.txt LOCALLY' (Chrome/Firefox)", 'info')
+                            self.queue_log(f"      2. Go to YouTube.com and export cookies.txt", 'info')
+                            self.queue_log(f"      3. In app: Click 📁 button next to 'Cookie File'", 'info')
+                            self.queue_log(f"      4. Select your cookies.txt file and retry", 'success')
+                            self.queue_log(f"   ", 'info')
+                            raise  # Stop this download
+                        else:
+                            # Cookies were used but still got bot error
+                            if cookies_source == 'file':
+                                self.queue_log(f"   🤖 BOT DETECTION even with cookies.txt file!", 'error')
+                                self.queue_log(f"   💡 File may be expired. Re-export from browser extension", 'warning')
+                            else:
+                                self.queue_log(f"   🤖 BOT DETECTION even with {selected_browser.capitalize()} cookies!", 'error')
+                                self.queue_log(f"   💡 Try: Close ALL {selected_browser.capitalize()} windows and retry", 'warning')
+                                self.queue_log(f"   💡 OR: Use cookies.txt file instead (see METHOD 2)", 'info')
+                            raise
+                    
+                    # Check if it's a cookie database error (only for browser cookies)
+                    elif ('Could not copy' in error_msg and 'cookie database' in error_msg) or \
+                       ('cookie' in error_msg.lower() and 'database' in error_msg.lower()):
+                        if not cookie_error_retried and cookies_loaded and cookies_source == 'browser':
+                            # Remove cookies and retry (only for browser cookies)
+                            self.queue_log(f"   ⚠️ Cookie database locked! {selected_browser.capitalize()} is running.", 'warning')
+                            self.queue_log(f"   💡 TIP: Close {selected_browser.capitalize()} OR use cookies.txt file instead", 'info')
+                            self.queue_log(f"   🔄 Retrying without cookies...", 'info')
+                            
+                            # Remove cookies from options
+                            if 'cookiesfrombrowser' in ydl_opts:
+                                del ydl_opts['cookiesfrombrowser']
+                            cookies_loaded = False
+                            cookies_source = None
+                            cookie_error_retried = True
+                            # Don't increment retry_count, this is a special retry
+                            continue
+                        else:
+                            # Already retried, fail
+                            raise
+                    
+                    # Check if it's a 429 error
+                    elif '429' in error_msg or 'Too Many Requests' in error_msg:
+                        retry_count += 1
+                        if retry_count < max_retries:
+                            # Exponential backoff: 10s, 30s, 60s (increased from 5s, 15s, 30s)
+                            wait_time = 10 * (3 ** (retry_count - 1))
+                            self.queue_log(f"   ⚠️ Rate limit hit! Retry {retry_count}/{max_retries} after {wait_time}s...", 'warning')
+                            time.sleep(wait_time)
+                        else:
+                            self.queue_log(f"   ❌ Max retries reached for 429 error", 'error')
+                            raise
+                    elif 'Requested format is not available' in error_msg or 'Only images are available' in error_msg:
+                        if cookies_loaded and cookies_source == 'browser':
+                            self.queue_log("   ⚠️ Format not available with browser cookies. Retrying without...", 'warning')
+                            if 'cookiesfrombrowser' in ydl_opts:
+                                del ydl_opts['cookiesfrombrowser']
+                            if 'extractor_args' not in ydl_opts:
+                                ydl_opts['extractor_args'] = {'youtube': {}}
+                            ydl_opts['extractor_args']['youtube']['player_client'] = ['android']
+                            cookies_loaded = False
+                            cookies_source = None
+                            continue
+                        elif cookies_loaded and cookies_source == 'file':
+                            self.queue_log("   ⚠️ Format not available with cookies.txt. Retrying without cookies...", 'warning')
+                            if 'cookiefile' in ydl_opts:
+                                del ydl_opts['cookiefile']
+                            if 'extractor_args' not in ydl_opts:
+                                ydl_opts['extractor_args'] = {'youtube': {}}
+                            ydl_opts['extractor_args']['youtube']['player_client'] = ['android']
+                            cookies_loaded = False
+                            cookies_source = None
+                            continue
+                        else:
+                            self.queue_log("   ❌ Format warning: No playable media format returned by yt-dlp for this video.", 'error')
+                            raise
+                    else:
+                        # Other error, don't retry
+                        raise
+            
+            # Get file size
+            file_size = 0
+            
+            # If only subtitles mode, check for subtitle files instead
+            if only_subtitles:
+                # Check if any subtitle files were downloaded
+                import glob
+                subtitle_files = glob.glob(os.path.join(self.downloader.subtitles_path, f"{base_filename}*.srt"))
+                if subtitle_files:
+                    self.queue_log(f"   ✅ Downloaded {len(subtitle_files)} subtitle file(s)", 'success')
+                    
+                    # Auto-format SRT files if enabled
+                    if self.auto_format_srt_var.get():
+                        self.queue_log(f"   🔧 Auto-formatting SRT files...", 'info')
+                        formatted_count = 0
+                        for srt_file in subtitle_files:
+                            try:
+                                # Format in-place (overwrite original file)
+                                clean_srt(srt_file, srt_file)
+                                formatted_count += 1
+                            except Exception as e:
+                                self.queue_log(f"   ⚠️ Format failed for {os.path.basename(srt_file)}: {str(e)}", 'warning')
+                        
+                        if formatted_count > 0:
+                            self.queue_log(f"   ✅ Formatted {formatted_count} SRT file(s)", 'success')
+                    
                     self.root.after(0, lambda: self.update_video_progress(video_info, 'success'))
                     return {
                         'status': 'success',
                         'title': video_info['title'],
-                        'filesize_mb': file_size,
-                        'video_path': video_full_path
+                        'filesize_mb': 0,  # Subtitles are small
+                        'subtitle_files': subtitle_files
                     }
                 else:
-                    # File not found - list files in directory for debugging
+                    self.queue_log(f"   ⚠️ No subtitles available for this video", 'warning')
+                    self.root.after(0, lambda: self.update_video_progress(video_info, 'skipped'))
+                    return {'status': 'skipped', 'message': 'No subtitles available'}
+            
+            # Normal mode: check for video file
+            if os.path.exists(video_full_path):
+                file_size = os.path.getsize(video_full_path) / (1024 * 1024)  # Convert to MB
+                self.queue_log(f"   ✅ Downloaded: {file_size:.1f} MB", 'success')
+                
+                # Auto-format SRT files if enabled and subtitles were downloaded
+                if self.auto_format_srt_var.get() and download_subtitles:
                     import glob
-                    video_dir = os.path.dirname(video_full_path)
-                    expected_basename = os.path.basename(base_path)
-                    similar_files = glob.glob(os.path.join(video_dir, f"{expected_basename}*"))
-                    
-                    error_msg = f'Expected file not found: {os.path.basename(video_full_path)}'
-                    if similar_files:
-                        self.queue_log(f"   ⚠️ Similar files found: {[os.path.basename(f) for f in similar_files]}", 'warning')
-                        # Check if any similar file exists with different extension
-                        for similar_file in similar_files:
-                            if os.path.exists(similar_file) and similar_file.endswith('.mp4'):
-                                file_size = os.path.getsize(similar_file) / (1024 * 1024)
-                                self.queue_log(f"   ✅ Found alternative: {file_size:.1f} MB", 'success')
-                                self.root.after(0, lambda: self.update_video_progress(video_info, 'success'))
-                                return {
-                                    'status': 'success',
-                                    'title': video_info['title'],
-                                    'filesize_mb': file_size,
-                                    'video_path': similar_file
-                                }
-                    
-                    self.queue_log(f"   ❌ {error_msg}", 'error')
-                    self.root.after(0, lambda: self.update_video_progress(video_info, 'error'))
-                    return {'status': 'error', 'message': error_msg}
+                    subtitle_files = glob.glob(os.path.join(self.downloader.subtitles_path, f"{base_filename}*.srt"))
+                    if subtitle_files:
+                        self.queue_log(f"   🔧 Auto-formatting {len(subtitle_files)} SRT file(s)...", 'info')
+                        formatted_count = 0
+                        for srt_file in subtitle_files:
+                            try:
+                                # Format in-place (overwrite original file)
+                                clean_srt(srt_file, srt_file)
+                                formatted_count += 1
+                            except Exception as e:
+                                self.queue_log(f"   ⚠️ Format failed for {os.path.basename(srt_file)}: {str(e)}", 'warning')
+                        
+                        if formatted_count > 0:
+                            self.queue_log(f"   ✅ Formatted {formatted_count} SRT file(s)", 'success')
+                
+                self.root.after(0, lambda: self.update_video_progress(video_info, 'success'))
+                return {
+                    'status': 'success',
+                    'title': video_info['title'],
+                    'filesize_mb': file_size,
+                    'video_path': video_full_path
+                }
+            else:
+                # File not found - list files in directory for debugging
+                import glob
+                video_dir = os.path.dirname(video_full_path)
+                expected_basename = os.path.basename(base_path)
+                similar_files = glob.glob(os.path.join(video_dir, f"{expected_basename}*"))
+                
+                error_msg = f'Expected file not found: {os.path.basename(video_full_path)}'
+                if similar_files:
+                    self.queue_log(f"   ⚠️ Similar files found: {[os.path.basename(f) for f in similar_files]}", 'warning')
+                    # Accept files with different or missing extensions if yt-dlp already finished.
+                    for similar_file in similar_files:
+                        if not os.path.exists(similar_file) or not os.path.isfile(similar_file):
+                            continue
+
+                        file_ext = os.path.splitext(similar_file)[1].lower()
+                        video_like_exts = {'', '.mp4', '.mkv', '.webm', '.m4v', '.mov'}
+                        if file_ext in video_like_exts:
+                            resolved_path = similar_file
+                            if file_ext == '' and not os.path.exists(video_full_path):
+                                try:
+                                    os.replace(similar_file, video_full_path)
+                                    resolved_path = video_full_path
+                                    self.queue_log(f"   OK Renamed extensionless file to: {os.path.basename(video_full_path)}", 'success')
+                                except Exception as rename_error:
+                                    self.queue_log(f"   Warning: Could not rename file: {str(rename_error)}", 'warning')
+
+                            file_size = os.path.getsize(resolved_path) / (1024 * 1024)
+                            self.queue_log(f"   ✅ Found alternative: {file_size:.1f} MB", 'success')
+                            
+                            # Auto-format SRT files if enabled and subtitles were downloaded
+                            if self.auto_format_srt_var.get() and download_subtitles:
+                                subtitle_files_alt = glob.glob(os.path.join(self.downloader.subtitles_path, f"{base_filename}*.srt"))
+                                if subtitle_files_alt:
+                                    self.queue_log(f"   🔧 Auto-formatting {len(subtitle_files_alt)} SRT file(s)...", 'info')
+                                    formatted_count = 0
+                                    for srt_file in subtitle_files_alt:
+                                        try:
+                                            # Format in-place (overwrite original file)
+                                            clean_srt(srt_file, srt_file)
+                                            formatted_count += 1
+                                        except Exception as e:
+                                            self.queue_log(f"   ⚠️ Format failed for {os.path.basename(srt_file)}: {str(e)}", 'warning')
+                                    
+                                    if formatted_count > 0:
+                                        self.queue_log(f"   ✅ Formatted {formatted_count} SRT file(s)", 'success')
+                            
+                            self.root.after(0, lambda: self.update_video_progress(video_info, 'success'))
+                            return {
+                                'status': 'success',
+                                'title': video_info['title'],
+                                'filesize_mb': file_size,
+                                'video_path': resolved_path
+                            }
+                
+                self.queue_log(f"   ❌ {error_msg}", 'error')
+                self.root.after(0, lambda: self.update_video_progress(video_info, 'error'))
+                return {'status': 'error', 'message': error_msg}
                     
         except Exception as e:
             self.queue_log(f"   ❌ Error: {str(e)[:100]}", 'error')
@@ -888,19 +1529,26 @@ class YouTubeDownloaderGUI:
             
             # Get parameters - check available videos after min_views filter
             min_views_filter = int(self.min_views_entry.get() or 0)
+            start_from = max(1, int(self.start_from_entry.get() or 1))
+            start_index = start_from - 1  # Convert to 0-based index
             requested_count = int(self.num_download_entry.get() or len(self.filtered_videos))
             available_count = len(self.filtered_videos)  # After min_views filter
-            num_to_download = min(requested_count, available_count)
+            available_from_start = max(0, available_count - start_index)
+            num_to_download = min(requested_count, available_from_start)
             
-            # Show clear message about min_views filter impact
-            if available_count < requested_count:
+            # Show clear message about min_views filter impact and start position
+            if start_index > 0:
+                self.queue_log(f"⚠️ START POSITION: Video #{start_from} (skipping first {start_index} video(s))", 'info')
+            
+            if available_from_start < requested_count:
                 self.queue_log(f"⚠️ FILTER IMPACT:", 'warning')
-                self.queue_log(f"   • You requested: {requested_count} videos", 'info')
+                self.queue_log(f"   • You requested: {requested_count} videos starting from #{start_from}", 'info')
                 self.queue_log(f"   • Min views filter: ≥ {min_views_filter:,} views", 'info')
-                self.queue_log(f"   • Videos available: {available_count} (after filter)", 'warning')
+                self.queue_log(f"   • Videos available: {available_count} (after filter)", 'info')
+                self.queue_log(f"   • Available from #{start_from}: {available_from_start}", 'warning')
                 self.queue_log(f"   → Will download: {num_to_download} videos only", 'success')
             else:
-                self.queue_log(f"✅ Sufficient videos: {available_count} available ≥ {requested_count} requested", 'success')
+                self.queue_log(f"✅ Ready: {num_to_download} videos from position #{start_from}", 'success')
             
             # Get number of threads
             max_workers = int(self.threads_combo.get())
@@ -913,21 +1561,99 @@ class YouTubeDownloaderGUI:
             
             naming_style = 'youtube' if self.naming_combo.current() == 0 else 'simple'
             download_thumbnails = self.download_thumbnails_var.get()
+            download_subtitles = self.download_subtitles_var.get()
+            only_subtitles = self.only_subtitles_var.get()
+            
+            # Get subtitle language selection
+            subtitle_lang_choice = self.subtitle_lang_combo.current()
+            subtitle_lang_map = {
+                0: ['vi'],  # Vietnamese only
+                1: ['en'],  # English only
+                2: ['vi', 'en'],  # Vietnamese + English
+                3: ['ja'],  # Japanese
+                4: ['ko'],  # Korean
+                5: ['zh-Hans'],  # Chinese Simplified
+                6: ['zh-Hant'],  # Chinese Traditional
+                7: ['es'],  # Spanish
+                8: ['fr'],  # French
+                9: ['de'],  # German
+                10: ['th'],  # Thai
+                11: ['id'],  # Indonesian
+                12: ['pt'],  # Portuguese
+                13: ['ru'],  # Russian
+                14: ['ar']  # Arabic
+            }
+            subtitle_langs = subtitle_lang_map.get(subtitle_lang_choice, ['vi', 'en'])
+            subtitle_lang_display = self.subtitle_lang_combo.get()
+            
+            # If only subtitles mode, force enable subtitles
+            if only_subtitles:
+                download_subtitles = True
+                # Auto-reduce threads for subtitle-only mode to avoid rate limiting
+                if max_workers > 2:
+                    original_workers = max_workers
+                    max_workers = 2  # Limit to 2 threads for subtitles
+                    self.queue_log(f"⚠️ AUTO-ADJUST: Reduced threads from {original_workers} to {max_workers} for subtitle-only mode", 'warning')
+                    self.queue_log(f"   (To avoid YouTube rate limiting - 429 errors)", 'info')
             
             self.queue_log("="*60, 'accent')
-            self.queue_log(f"⬇️ STARTING DOWNLOAD", 'accent')
+            if only_subtitles:
+                self.queue_log(f"📄 STARTING SUBTITLES-ONLY DOWNLOAD", 'accent')
+            else:
+                self.queue_log(f"⬇️ STARTING DOWNLOAD", 'accent')
             self.queue_log(f"   Min views: ≥ {min_views_filter:,} → {available_count} videos available", 'info')
+            self.queue_log(f"   Range: Videos #{start_from}-{start_from + num_to_download - 1}", 'info')
             self.queue_log(f"   Downloading: {num_to_download} videos", 'success')
-            self.queue_log(f"   Quality: {quality} | Naming: {naming_style}", 'info')
-            self.queue_log(f"   Thumbnails: {'Yes' if download_thumbnails else 'No'}", 'info')
-            self.queue_log(f"   🎯 Mode: Auto-detect with audio guarantee (FFmpeg merge)", 'success')
+            if only_subtitles:
+                self.queue_log(f"   Mode: SUBTITLES ONLY (Video & Thumbnails skipped)", 'warning')
+                self.queue_log(f"   ⏱️ Rate Limit Protection: 5-10s delay per request", 'info')
+                self.queue_log(f"   🔄 Auto Retry: 3 attempts with exponential backoff", 'info')
+            else:
+                self.queue_log(f"   Quality: {quality} | Naming: {naming_style}", 'info')
+                self.queue_log(f"   Thumbnails: {'Yes' if download_thumbnails else 'No'}", 'info')
+            if download_subtitles:
+                self.queue_log(f"   Subtitles: {subtitle_lang_display}", 'info')
+                # Show auto-format status
+                if self.auto_format_srt_var.get():
+                    self.queue_log(f"   🔧 Auto-format: Enabled (SRT will be cleaned automatically)", 'success')
+                else:
+                    self.queue_log(f"   🔧 Auto-format: Disabled", 'warning')
+            else:
+                self.queue_log(f"   Subtitles: No", 'info')
+            if not only_subtitles:
+                self.queue_log(f"   🚀 Mode: SPEED OPTIMIZED - Audio guarantee + Fast download", 'success')
+                self.queue_log(f"      • Concurrent fragments: 3x | Chunk size: 10MB", 'info')
+                self.queue_log(f"      • Smart retries | Fast thumbnail (HQ quality)", 'info')
             self.queue_log(f"   ⚡ Threads: {max_workers} (Parallel downloads)", 'info')
+            
+            # Show anti-bot settings
+            cookies_file_path_check = None
+            if not self.cookies_file_placeholder and self.cookies_file_entry.get().strip():
+                cookies_file_path_check = self.cookies_file_entry.get().strip()
+                if os.path.exists(cookies_file_path_check):
+                    self.queue_log(f"   🔒 Anti-bot: Using cookies.txt file + Multi-client fallback", 'success')
+                    self.queue_log(f"   📄 File: {os.path.basename(cookies_file_path_check)}", 'info')
+                else:
+                    self.queue_log(f"   ⚠️ Cookies file not found, will try browser cookies or no cookies", 'warning')
+                    cookies_file_path_check = None
+            
+            if not cookies_file_path_check:
+                cookies_browser_idx = self.cookies_browser_combo.current()
+                if cookies_browser_idx > 0:
+                    browser_name = self.cookies_browser_combo.get()
+                    self.queue_log(f"   🔒 Anti-bot: Using {browser_name} cookies + Multi-client fallback", 'success')
+                    self.queue_log(f"   ⚠️ IMPORTANT: Make sure {browser_name} is CLOSED!", 'warning')
+                else:
+                    self.queue_log(f"   🔒 Anti-bot: Multi-client fallback (Android/iOS/Web/Mobile)", 'info')
+                    self.queue_log(f"   ⚠️ WARNING: YouTube may block without cookies!", 'error')
+                    self.queue_log(f"   💡 If download fails: Use Browser Cookies or cookies.txt file", 'warning')
+            
             self.queue_log("="*60, 'accent')
             
-            # Prepare download tasks
+            # Prepare download tasks - use start_index to skip videos
             download_tasks = []
-            for i, video_info in enumerate(self.filtered_videos[:num_to_download], 1):
-                download_tasks.append((i, video_info, quality, naming_style, download_thumbnails, num_to_download))
+            for i, video_info in enumerate(self.filtered_videos[start_index:start_index + num_to_download], start_from):
+                download_tasks.append((i, video_info, quality, naming_style, download_thumbnails, download_subtitles, only_subtitles, subtitle_langs, num_to_download))
             
             # Download with ThreadPoolExecutor
             downloaded = []
@@ -998,46 +1724,94 @@ class YouTubeDownloaderGUI:
             total_success = len(downloaded) + len(skipped)
             
             if total_success == 0:
-                self.queue_log(f"❌ DOWNLOAD FAILED - No videos available", 'error')
-                self.queue_log(f"   Attempted: {num_to_download} videos", 'warning')
-                self.queue_log(f"   Failed: {len(failed)} videos", 'error')
-                
-                # Show error details
-                self.queue_log(f"\n   💡 Possible reasons:", 'warning')
-                self.queue_log(f"   - Videos may be private/deleted/restricted", 'info')
-                self.queue_log(f"   - Internet connection issues", 'info')
-                self.queue_log(f"   - YouTube blocking requests", 'info')
-                self.queue_log(f"   - Check video URLs are valid", 'info')
+                if only_subtitles:
+                    self.queue_log(f"❌ SUBTITLE DOWNLOAD FAILED - No subtitles available", 'error')
+                    self.queue_log(f"   Attempted: {num_to_download} videos", 'warning')
+                    self.queue_log(f"   Failed: {len(failed)} videos", 'error')
+                    self.queue_log(f"\n   💡 Possible reasons:", 'warning')
+                    self.queue_log(f"   - Videos may not have subtitles available", 'info')
+                    self.queue_log(f"   - Internet connection issues", 'info')
+                else:
+                    self.queue_log(f"❌ DOWNLOAD FAILED - No videos available", 'error')
+                    self.queue_log(f"   Attempted: {num_to_download} videos", 'warning')
+                    self.queue_log(f"   Failed: {len(failed)} videos", 'error')
+                    
+                    # Check if bot detection was the issue
+                    cookies_file_used = not self.cookies_file_placeholder and self.cookies_file_entry.get().strip()
+                    cookies_browser_idx = self.cookies_browser_combo.current()
+                    
+                    if not cookies_file_used and cookies_browser_idx == 0:  # No cookies used at all
+                        self.queue_log(f"\n   🤖 BOT DETECTION? You didn't use cookies!", 'error')
+                        self.queue_log(f"   ", 'error')
+                        self.queue_log(f"   ✅ SOLUTION - Choose ONE:", 'accent')
+                        self.queue_log(f"   ", 'info')
+                        self.queue_log(f"   METHOD 1: Browser Cookies", 'accent')
+                        self.queue_log(f"      1. Open Chrome/Edge and LOGIN to YouTube", 'info')
+                        self.queue_log(f"      2. CLOSE Chrome/Edge completely", 'warning')
+                        self.queue_log(f"      3. Select 'Cookies: Chrome' or 'Edge'", 'info')
+                        self.queue_log(f"      4. Retry download", 'success')
+                        self.queue_log(f"   ", 'info')
+                        self.queue_log(f"   METHOD 2: Cookies.txt File (No need to close browser!)", 'accent')
+                        self.queue_log(f"      1. Install extension: 'Get cookies.txt LOCALLY'", 'info')
+                        self.queue_log(f"      2. Export cookies.txt from YouTube.com", 'info')
+                        self.queue_log(f"      3. Click 📁 button and select cookies.txt", 'info')
+                        self.queue_log(f"      4. Retry download", 'success')
+                        self.queue_log(f"   ", 'info')
+                    
+                    # Show other error details
+                    self.queue_log(f"   💡 Other possible reasons:", 'warning')
+                    self.queue_log(f"   - Videos may be private/deleted/restricted", 'info')
+                    self.queue_log(f"   - Internet connection issues", 'info')
+                    self.queue_log(f"   - Check video URLs are valid", 'info')
             else:
                 self.queue_log(f"✅ PROCESS COMPLETE!", 'success')
-                self.queue_log(f"   Newly downloaded: {len(downloaded)} video(s)", 'success')
+                if only_subtitles:
+                    self.queue_log(f"   Subtitles downloaded: {len(downloaded)} video(s)", 'success')
+                else:
+                    self.queue_log(f"   Newly downloaded: {len(downloaded)} video(s)", 'success')
                 if len(skipped) > 0:
-                    self.queue_log(f"   Already existed: {len(skipped)} video(s)", 'info')
+                    if only_subtitles:
+                        self.queue_log(f"   No subtitles: {len(skipped)} video(s)", 'info')
+                    else:
+                        self.queue_log(f"   Already existed: {len(skipped)} video(s)", 'info')
                 if len(failed) > 0:
                     self.queue_log(f"   Failed: {len(failed)} video(s)", 'warning')
-                self.queue_log(f"   Total available: {total_success}/{num_to_download} video(s)", 'success')
+                if only_subtitles:
+                    self.queue_log(f"   Total processed: {total_success}/{num_to_download} subtitle(s)", 'success')
+                else:
+                    self.queue_log(f"   Total available: {total_success}/{num_to_download} video(s)", 'success')
             
             # Calculate total size (only newly downloaded files)
             total_size = sum(v.get('filesize_mb', 0) for v in downloaded)
-            if total_size > 0:
+            if total_size > 0 and not only_subtitles:
                 self.queue_log(f"   New download size: {total_size:.1f} MB", 'info')
             
             # Show completion dialog if any videos available
             if total_success > 0:
                 success_msg = f"Process completed successfully!\n\n"
-                success_msg += f"✅ Newly downloaded: {len(downloaded)} video(s)"
-                if total_size > 0:
-                    success_msg += f" ({total_size:.1f} MB)"
+                if only_subtitles:
+                    success_msg += f"📝 Subtitles downloaded: {len(downloaded)}"
+                else:
+                    success_msg += f"✅ Newly downloaded: {len(downloaded)} video(s)"
+                    if total_size > 0:
+                        success_msg += f" ({total_size:.1f} MB)"
                 success_msg += "\n"
                 
                 if len(skipped) > 0:
-                    success_msg += f"⏭️ Already existed: {len(skipped)} video(s)\n"
+                    if only_subtitles:
+                        success_msg += f"⏭️ No subtitles: {len(skipped)}\n"
+                    else:
+                        success_msg += f"⏭️ Already existed: {len(skipped)} video(s)\n"
                 
                 if len(failed) > 0:
-                    success_msg += f"❌ Failed: {len(failed)} video(s)\n"
+                    success_msg += f"❌ Failed: {len(failed)}\n"
                 
-                success_msg += f"\n📊 Total available: {total_success}/{num_to_download}\n"
-                success_msg += f"📁 Location: {self.downloader.download_path}"
+                if only_subtitles:
+                    success_msg += f"\n📊 Total processed: {total_success}/{num_to_download} subtitles\n"
+                    success_msg += f"📁 Location: {self.downloader.subtitles_path}"
+                else:
+                    success_msg += f"\n📊 Total available: {total_success}/{num_to_download}\n"
+                    success_msg += f"📁 Location: {self.downloader.download_path}"
                 
                 self.root.after(0, lambda msg=success_msg: messagebox.showinfo(
                     "✅ Process Complete",
@@ -1045,12 +1819,19 @@ class YouTubeDownloaderGUI:
                 ))
             else:
                 # All failed
-                error_msg = f"Failed to download {num_to_download} video(s)!\n\n"
-                error_msg += "Possible reasons:\n"
-                error_msg += "• Videos are private/deleted\n"
-                error_msg += "• Internet connection issue\n" 
-                error_msg += "• YouTube blocking requests\n\n"
-                error_msg += "Check the log for details."
+                if only_subtitles:
+                    error_msg = f"Failed to download subtitles for {num_to_download} video(s)!\n\n"
+                    error_msg += "Possible reasons:\n"
+                    error_msg += "• Videos may not have subtitles\n"
+                    error_msg += "• Internet connection issue\n\n"
+                    error_msg += "Check the log for details."
+                else:
+                    error_msg = f"Failed to download {num_to_download} video(s)!\n\n"
+                    error_msg += "Possible reasons:\n"
+                    error_msg += "• Videos are private/deleted\n"
+                    error_msg += "• Internet connection issue\n" 
+                    error_msg += "• YouTube blocking requests\n\n"
+                    error_msg += "Check the log for details."
                 
                 self.root.after(0, lambda msg=error_msg: messagebox.showerror(
                     "❌ Download Failed",
@@ -1070,7 +1851,7 @@ class YouTubeDownloaderGUI:
             self.stop_btn.config(state='disabled')  # Disable stop button
             self.executor = None  # Clear executor reference
     
-    def get_channel_info_ytdlp(self, channel_url, download_path):
+    def get_channel_info_ytdlp(self, channel_url, download_path, cookies_file_path=None, selected_browser=None):
         """Get channel info using yt-dlp (more reliable)"""
         try:
             # First, try to get channel videos specifically
@@ -1087,10 +1868,14 @@ class YouTubeDownloaderGUI:
             }
             
             # Add cookies if available
-            if self.cookies_file and os.path.exists(self.cookies_file):
-                ydl_opts['cookiefile'] = self.cookies_file
+            if cookies_file_path and os.path.exists(cookies_file_path):
+                ydl_opts['cookiefile'] = cookies_file_path
                 self.queue_log(f"🍪 Using cookies for authentication", 'info')
             
+            elif selected_browser:
+                ydl_opts['cookiesfrombrowser'] = (selected_browser,)
+                self.queue_log(f"ðŸª Using {selected_browser.capitalize()} browser cookies for channel scan", 'info')
+
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(videos_url, download=False)
                 
@@ -1185,12 +1970,14 @@ class YouTubeDownloaderGUI:
                     'filtered_videos': [],
                     'video_path': os.path.join(download_path, 'videos'),
                     'thumbnail_path': os.path.join(download_path, 'thumbnails'),
+                    'subtitles_path': os.path.join(download_path, 'subtitles'),
                     'sanitize_filename': lambda self, filename, max_length=100: downloader_obj.sanitize_filename(filename, max_length)
                 })()
                 
                 # Create directories
                 os.makedirs(self.downloader.video_path, exist_ok=True)
                 os.makedirs(self.downloader.thumbnail_path, exist_ok=True)
+                os.makedirs(self.downloader.subtitles_path, exist_ok=True)
                 
                 # Filter videos
                 self.filter_videos()
@@ -1252,15 +2039,16 @@ class YouTubeDownloaderGUI:
         return f"{prefix}{title}"
     
     def download_thumbnail_manual(self, video_info, sequence_number=None):
-        """Download thumbnail manually in 16:9 aspect ratio with optional sequence number"""
+        """Download thumbnail manually in 16:9 aspect ratio with optional sequence number - Optimized for speed"""
         try:
             import urllib.request
             from PIL import Image, ImageOps
             
+            # Prioritize hqdefault (480x360) for faster download, fallback to higher quality
             thumbnail_urls = [
-                f"https://img.youtube.com/vi/{video_info['video_id']}/maxresdefault.jpg",
-                f"https://img.youtube.com/vi/{video_info['video_id']}/hqdefault.jpg",
-                f"https://img.youtube.com/vi/{video_info['video_id']}/mqdefault.jpg",
+                f"https://img.youtube.com/vi/{video_info['video_id']}/hqdefault.jpg",  # Fast, good quality
+                f"https://img.youtube.com/vi/{video_info['video_id']}/maxresdefault.jpg",  # High quality fallback
+                f"https://img.youtube.com/vi/{video_info['video_id']}/mqdefault.jpg",  # Low quality fallback
             ]
             
             # Generate filename with sequence number (matching video filename)
@@ -1307,6 +2095,117 @@ class YouTubeDownloaderGUI:
         except Exception as e:
             self.queue_log(f"   ⚠️ Thumbnail error: {str(e)}", 'warning')
             return None
+    
+    def clean_srt_file_dialog(self):
+        """Open dialog to select and clean a single SRT file"""
+        try:
+            # Open file dialog to select SRT file
+            input_file = filedialog.askopenfilename(
+                title="Select SRT File to Format",
+                filetypes=[("Subtitle Files", "*.srt"), ("All Files", "*.*")]
+            )
+            
+            if not input_file:
+                return
+            
+            # Ask for output location
+            save_folder = filedialog.askdirectory(title="Select Output Folder")
+            
+            if not save_folder:
+                return
+            
+            # Generate output filename
+            filename = os.path.basename(input_file)
+            base_name = filename.rsplit('.', 1)[0]
+            output_file = os.path.join(save_folder, f"{base_name}_formatted.srt")
+            
+            # Clean the SRT file
+            self.queue_log(f"\n🔧 Formatting SRT file...", 'info')
+            self.queue_log(f"   Input: {input_file}", 'info')
+            
+            clean_srt(input_file, output_file)
+            
+            self.queue_log(f"   ✅ Formatted file saved: {output_file}", 'success')
+            messagebox.showinfo("✅ Success", 
+                              f"SRT file formatted successfully!\n\n"
+                              f"Output: {output_file}")
+        
+        except Exception as e:
+            error_msg = f"Failed to format SRT file: {str(e)}"
+            self.queue_log(f"   ❌ {error_msg}", 'error')
+            messagebox.showerror("❌ Error", error_msg)
+    
+    def clean_all_srt_files(self):
+        """Clean all SRT files in the subtitles folder"""
+        try:
+            # Check if downloader is initialized and has a subtitles path
+            if not hasattr(self, 'downloader') or not self.downloader:
+                messagebox.showwarning("⚠️ Warning", 
+                                     "Please set a download folder first by clicking 'Browse'.")
+                return
+            
+            subtitles_path = self.downloader.subtitles_path
+            
+            # Find all SRT files
+            import glob
+            srt_files = glob.glob(os.path.join(subtitles_path, "*.srt"))
+            
+            if not srt_files:
+                messagebox.showinfo("ℹ️ Info", 
+                                  f"No SRT files found in:\n{subtitles_path}")
+                return
+            
+            # Ask for confirmation
+            result = messagebox.askyesno("🔧 Format All SRT Files",
+                                        f"Found {len(srt_files)} SRT file(s).\n\n"
+                                        f"Format all files and save as '_formatted.srt'?\n\n"
+                                        f"Location: {subtitles_path}")
+            
+            if not result:
+                return
+            
+            # Clean all files
+            self.queue_log(f"\n🔧 Formatting {len(srt_files)} SRT files...", 'accent')
+            
+            success_count = 0
+            failed_count = 0
+            
+            for srt_file in srt_files:
+                try:
+                    # Skip already formatted files
+                    if "_formatted.srt" in srt_file:
+                        continue
+                    
+                    filename = os.path.basename(srt_file)
+                    base_name = filename.rsplit('.', 1)[0]
+                    output_file = os.path.join(subtitles_path, f"{base_name}_formatted.srt")
+                    
+                    # Clean the file
+                    clean_srt(srt_file, output_file)
+                    
+                    self.queue_log(f"   ✅ {filename}", 'success')
+                    success_count += 1
+                    
+                except Exception as e:
+                    self.queue_log(f"   ❌ {os.path.basename(srt_file)}: {str(e)}", 'error')
+                    failed_count += 1
+            
+            # Summary
+            self.queue_log(f"\n📊 Summary:", 'accent')
+            self.queue_log(f"   ✅ Successfully formatted: {success_count}", 'success')
+            if failed_count > 0:
+                self.queue_log(f"   ❌ Failed: {failed_count}", 'error')
+            
+            messagebox.showinfo("✅ Complete",
+                              f"SRT formatting complete!\n\n"
+                              f"✅ Formatted: {success_count} file(s)\n"
+                              f"❌ Failed: {failed_count} file(s)\n\n"
+                              f"Location: {subtitles_path}")
+        
+        except Exception as e:
+            error_msg = f"Failed to format SRT files: {str(e)}"
+            self.queue_log(f"   ❌ {error_msg}", 'error')
+            messagebox.showerror("❌ Error", error_msg)
 
 
 def main():
